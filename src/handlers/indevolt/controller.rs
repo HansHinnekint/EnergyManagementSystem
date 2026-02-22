@@ -22,9 +22,12 @@ async fn send_command(client: &Client, base_url: &str, cfg: &SetDataConfig) -> R
     let config_str = serde_json::to_string(cfg)
         .map_err(|e| format!("[Indevolt] Failed to serialise SetData config: {}", e))?;
 
-    let response = client
-        .get(&url)
-        .query(&[("config", &config_str)])
+    let mut req_url = reqwest::Url::parse(&url)
+        .map_err(|e| format!("[Indevolt] Invalid URL {}: {}", url, e))?;
+    req_url.query_pairs_mut().append_pair("config", &config_str);
+
+    let response: reqwest::Response = client
+        .get(req_url)
         .send()
         .await
         .map_err(|e| format!("[Indevolt] HTTP error sending SetData {:?}: {}", cfg, e))?;

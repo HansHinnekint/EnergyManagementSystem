@@ -70,11 +70,12 @@ pub async fn read_battery_snapshot(base_url: &str, device_model: &str) -> Batter
         SNAPSHOT_IDS.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
     );
 
-    let url = format!("{}/rpc/Indevolt.GetData", base_url);
+    let mut req_url = reqwest::Url::parse(&format!("{}/rpc/Indevolt.GetData", base_url))
+        .expect("Invalid base_url");
+    req_url.query_pairs_mut().append_pair("config", &ids_json);
 
-    let result = client
-        .get(&url)
-        .query(&[("config", &ids_json)])
+    let result: Result<reqwest::Response, reqwest::Error> = client
+        .get(req_url)
         .send()
         .await;
 
