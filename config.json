@@ -1,7 +1,7 @@
 {
     "p1_url":               "http://172.19.11.76/api/v1/data",
-    "indevolt_url":         "http://172.19.11.102",
-    "poll_interval_seconds": 30,
+    "indevolt_url":         "http://172.19.11.102:8080",
+    "poll_interval_seconds": 10,
 
     "battery_rated_capacity_kwh":       12.0,
     "battery_min_soc_percent":          10.0,

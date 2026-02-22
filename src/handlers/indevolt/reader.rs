@@ -1,171 +1,152 @@
-use log::{debug, error, warn};
+use log::{debug, error};
 use reqwest::Client;
+use std::collections::HashMap;
 
-use crate::models::indevolt_models::{BatteryConfig, BatterySnapshot, SensorReading};
-
-// --------------------------------------------------------------------------------------------------------------
-// Sensor key constants - adjust these to match your exact Indevolt firmware key names.
-
-const KEY_SOC:                    &str = "BatterySOC";
-const KEY_BATTERY_STATE:          &str = "BatteryState";
-const KEY_WORKING_MODE:           &str = "WorkingMode";
-const KEY_BATTERY_POWER:          &str = "BatteryPower";
-const KEY_DC_INPUT1:              &str = "DCInputPower1";
-const KEY_DC_INPUT2:              &str = "DCInputPower2";
-const KEY_TOTAL_DC_OUTPUT:        &str = "TotalDCOutputPower";
-const KEY_TOTAL_AC_OUTPUT:        &str = "TotalACOutputPower";
-const KEY_TOTAL_AC_INPUT:         &str = "TotalACInputPower";
-const KEY_METER_POWER:            &str = "MeterPower";
-const KEY_DAILY_PRODUCTION:       &str = "DailyProduction";
-const KEY_CUMULATIVE_PRODUCTION:  &str = "CumulativeProduction";
-const KEY_DAILY_CHARGING:         &str = "DailyCharging";
-const KEY_DAILY_DISCHARGING:      &str = "DailyDischarging";
-const KEY_TOTAL_CHARGING:         &str = "TotalCharging";
-const KEY_TOTAL_DISCHARGING:      &str = "TotalDischarging";
-const KEY_TOTAL_AC_INPUT_ENERGY:  &str = "TotalACInputEnergy";
-
-const KEY_RATED_CAPACITY:         &str = "RatedCapacity";
-const KEY_MIN_SOC:                &str = "MinSOC";
-const KEY_MAX_SOC:                &str = "MaxSOC";
-const KEY_MAX_CHARGE_POWER:       &str = "MaxChargePower";
-const KEY_MAX_DISCHARGE_POWER:    &str = "MaxDischargePower";
-
-// All snapshot keys batched together for efficient polling.
-const SNAPSHOT_KEYS: &[&str] = &[
-    KEY_SOC, KEY_BATTERY_STATE, KEY_WORKING_MODE,
-    KEY_BATTERY_POWER, KEY_DC_INPUT1, KEY_DC_INPUT2,
-    KEY_TOTAL_DC_OUTPUT, KEY_TOTAL_AC_OUTPUT, KEY_TOTAL_AC_INPUT,
-    KEY_METER_POWER, KEY_DAILY_PRODUCTION, KEY_CUMULATIVE_PRODUCTION,
-    KEY_DAILY_CHARGING, KEY_DAILY_DISCHARGING,
-    KEY_TOTAL_CHARGING, KEY_TOTAL_DISCHARGING, KEY_TOTAL_AC_INPUT_ENERGY,
-];
-
-const CONFIG_KEYS: &[&str] = &[
-    KEY_RATED_CAPACITY, KEY_MIN_SOC, KEY_MAX_SOC,
-    KEY_MAX_CHARGE_POWER, KEY_MAX_DISCHARGE_POWER,
-];
+use crate::models::indevolt_models::BatterySnapshot;
 
 // --------------------------------------------------------------------------------------------------------------
+// Numeric sensor IDs for the Indevolt RPC bulk-read API.
+//
+// API:  GET /rpc/Indevolt.GetData?config={"t":[id,...]}
+// Resp: flat JSON object  {"<id>": <numeric_value>, ...}
+//
+// Official Indevolt firmware sensor ID mapping:
+//   7101  Working mode              1=Self-consumed, 5=Schedule
+//   1664  DC Input Power 1 (PV1)   W
+//   1665  DC Input Power 2 (PV2)   W
+//   1501  Total DC Output Power     W
+//   2108  Total AC Output Power     W
+//   1502  Daily Production          kWh
+//   1505  Cumulative Production     raw ×0.001 → kWh
+//   2101  Total AC Input Power      W
+//   2107  Total AC Input Energy     kWh
+//   6000  Battery Power             W
+//   6001  Battery State             1000=Static, 1001=Charging, 1002=Discharging
+//   6002  Total Battery SOC         %
+//   6004  Battery Daily Charging    kWh
+//   6005  Battery Daily Discharging kWh
+//   6006  Battery Total Charging    kWh
+//   6007  Battery Total Discharging kWh
+//   11016 Meter Power (grid)        W  positive=import, negative=export
+// --------------------------------------------------------------------------------------------------------------
 
-/// Fetch a single sensor reading from GET /device/sensor?key=<KEY>
-async fn fetch_sensor(client: &Client, base_url: &str, key: &str) -> Option<SensorReading> {
-    let url = format!("{}/device/sensor?key={}", base_url, key);
-    let response = client.get(&url).send().await;
+const ID_WORKING_MODE:              u32 = 7101;  // 1=Self-consumed, 5=Schedule
+const ID_DC_INPUT1:                 u32 = 1664;  // W  PV string 1
+const ID_DC_INPUT2:                 u32 = 1665;  // W  PV string 2
+const ID_TOTAL_DC_OUTPUT:           u32 = 1501;  // W
+const ID_TOTAL_AC_OUTPUT:           u32 = 2108;  // W
+const ID_DAILY_PRODUCTION:          u32 = 1502;  // kWh
+const ID_CUMULATIVE_PRODUCTION:     u32 = 1505;  // raw ×0.001 = kWh
+const ID_TOTAL_AC_INPUT:            u32 = 2101;  // W
+const ID_TOTAL_AC_INPUT_ENERGY:     u32 = 2107;  // kWh
+const ID_BATTERY_POWER:             u32 = 6000;  // W
+const ID_BATTERY_STATE:             u32 = 6001;  // 1000=Static, 1001=Charging, 1002=Discharging
+const ID_BATTERY_SOC:               u32 = 6002;  // %
+const ID_DAILY_CHARGING:            u32 = 6004;  // kWh
+const ID_DAILY_DISCHARGING:         u32 = 6005;  // kWh
+const ID_TOTAL_CHARGING:            u32 = 6006;  // kWh
+const ID_TOTAL_DISCHARGING:         u32 = 6007;  // kWh
+const ID_METER_POWER:               u32 = 11016; // W  grid (positive=import)
 
-    match response {
+/// All IDs requested in one shot (order mirrors the firmware table).
+const SNAPSHOT_IDS: &[u32] = &[
+    ID_WORKING_MODE, ID_DC_INPUT1, ID_DC_INPUT2,
+    ID_TOTAL_DC_OUTPUT, ID_TOTAL_AC_OUTPUT, ID_DAILY_PRODUCTION,
+    ID_CUMULATIVE_PRODUCTION, ID_TOTAL_AC_INPUT, ID_TOTAL_AC_INPUT_ENERGY,
+    ID_BATTERY_POWER, ID_BATTERY_STATE, ID_BATTERY_SOC,
+    ID_DAILY_CHARGING, ID_DAILY_DISCHARGING,
+    ID_TOTAL_CHARGING, ID_TOTAL_DISCHARGING, ID_METER_POWER,
+];
+
+// --------------------------------------------------------------------------------------------------------------
+
+/// Fetch all snapshot values in a single GET /rpc/Indevolt.GetData call.
+pub async fn read_battery_snapshot(base_url: &str, device_model: &str) -> BatterySnapshot {
+    let client = Client::new();
+
+    // Build the config query parameter: {"t":[id,...]}
+    let ids_json = format!(
+        "{{\"t\":[{}]}}",
+        SNAPSHOT_IDS.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+    );
+
+    let url = format!("{}/rpc/Indevolt.GetData", base_url);
+
+    let result = client
+        .get(&url)
+        .query(&[("config", &ids_json)])
+        .send()
+        .await;
+
+    let data: HashMap<String, serde_json::Value> = match result {
         Ok(resp) if resp.status().is_success() => {
-            match resp.json::<SensorReading>().await {
-                Ok(reading) => {
-                    debug!("[Indevolt] {} = {} {:?}", reading.key, reading.value, reading.unit);
-                    Some(reading)
-                }
+            match resp.json().await {
+                Ok(map) => map,
                 Err(e) => {
-                    warn!("[Indevolt] Failed to parse sensor '{}': {}", key, e);
-                    None
+                    error!("[Indevolt] Failed to parse GetData response: {}", e);
+                    HashMap::new()
                 }
             }
         }
         Ok(resp) => {
-            warn!("[Indevolt] Sensor '{}' returned HTTP {}", key, resp.status());
-            None
+            error!("[Indevolt] GetData returned HTTP {}", resp.status());
+            HashMap::new()
         }
         Err(e) => {
-            error!("[Indevolt] HTTP error fetching sensor '{}': {}", key, e);
-            None
+            error!("[Indevolt] GetData request failed: {}", e);
+            HashMap::new()
         }
-    }
-}
+    };
 
-// --------------------------------------------------------------------------------------------------------------
+    debug!("[Indevolt] GetData raw: {:?}", data);
 
-/// Fetch all snapshot sensor keys concurrently and assemble a BatterySnapshot.
-/// Individual key failures result in the field keeping its Default value (0 / empty string).
-pub async fn read_battery_snapshot(base_url: &str, device_model: &str) -> BatterySnapshot {
-    let client = Client::new();
-
-    // Fire all requests concurrently.
-    let futures: Vec<_> = SNAPSHOT_KEYS
-        .iter()
-        .map(|key| fetch_sensor(&client, base_url, key))
-        .collect();
-
-    let results = futures::future::join_all(futures).await;
-
-    // Build a lookup map from the results.
-    let readings: std::collections::HashMap<String, String> = results
-        .into_iter()
-        .flatten()
-        .map(|r| (r.key, r.value))
-        .collect();
-
-    let parse_f64 = |key: &str| -> f64 {
-        readings.get(key)
-            .and_then(|v| v.parse().ok())
+    // Helpers to extract typed values by numeric ID.
+    let f64_id = |id: u32| -> f64 {
+        data.get(&id.to_string())
+            .and_then(|v| v.as_f64())
             .unwrap_or(0.0)
     };
-    let parse_i32 = |key: &str| -> i32 {
-        readings.get(key)
-            .and_then(|v| v.parse().ok())
+    let i32_id = |id: u32| -> i32 {
+        data.get(&id.to_string())
+            .and_then(|v| v.as_f64())
+            .map(|f| f as i32)
             .unwrap_or(0)
     };
-    let parse_str = |key: &str| -> String {
-        readings.get(key).cloned().unwrap_or_default()
+
+    // Decode battery state integer to human-readable string.
+    let battery_state = match i32_id(ID_BATTERY_STATE) {
+        1000 => "Static".to_string(),
+        1001 => "Charging".to_string(),
+        1002 => "Discharging".to_string(),
+        code => format!("Unknown({})", code),
+    };
+
+    // Decode working mode integer to human-readable string.
+    let working_mode = match i32_id(ID_WORKING_MODE) {
+        1 => "Self-consumed Prioritized".to_string(),
+        4 => "Real-time Control".to_string(),
+        5 => "Schedule".to_string(),
+        code => format!("Mode({})", code),
     };
 
     BatterySnapshot {
         device_model:              device_model.to_string(),
-        battery_soc:               parse_f64(KEY_SOC),
-        battery_state:             parse_str(KEY_BATTERY_STATE),
-        working_mode:              parse_str(KEY_WORKING_MODE),
-        battery_power_w:           parse_i32(KEY_BATTERY_POWER),
-        dc_input_power1_w:         parse_i32(KEY_DC_INPUT1),
-        dc_input_power2_w:         parse_i32(KEY_DC_INPUT2),
-        total_dc_output_power_w:   parse_i32(KEY_TOTAL_DC_OUTPUT),
-        total_ac_output_power_w:   parse_i32(KEY_TOTAL_AC_OUTPUT),
-        total_ac_input_power_w:    parse_i32(KEY_TOTAL_AC_INPUT),
-        meter_power_w:             parse_i32(KEY_METER_POWER),
-        daily_production_kwh:      parse_f64(KEY_DAILY_PRODUCTION),
-        cumulative_production_kwh: parse_f64(KEY_CUMULATIVE_PRODUCTION),
-        daily_charging_kwh:        parse_f64(KEY_DAILY_CHARGING),
-        daily_discharging_kwh:     parse_f64(KEY_DAILY_DISCHARGING),
-        total_charging_kwh:        parse_f64(KEY_TOTAL_CHARGING),
-        total_discharging_kwh:     parse_f64(KEY_TOTAL_DISCHARGING),
-        total_ac_input_energy_kwh: parse_f64(KEY_TOTAL_AC_INPUT_ENERGY),
-    }
-}
-
-// --------------------------------------------------------------------------------------------------------------
-
-/// Fetch the static battery configuration from the device.
-pub async fn read_battery_config(base_url: &str, device_model: &str) -> BatteryConfig {
-    let client = Client::new();
-
-    let futures: Vec<_> = CONFIG_KEYS
-        .iter()
-        .map(|key| fetch_sensor(&client, base_url, key))
-        .collect();
-
-    let results = futures::future::join_all(futures).await;
-
-    let readings: std::collections::HashMap<String, String> = results
-        .into_iter()
-        .flatten()
-        .map(|r| (r.key, r.value))
-        .collect();
-
-    let parse_f64 = |key: &str| -> f64 {
-        readings.get(key).and_then(|v| v.parse().ok()).unwrap_or(0.0)
-    };
-    let parse_i32 = |key: &str| -> i32 {
-        readings.get(key).and_then(|v| v.parse().ok()).unwrap_or(0)
-    };
-
-    BatteryConfig {
-        device_model:          device_model.to_string(),
-        rated_capacity_kwh:    parse_f64(KEY_RATED_CAPACITY),
-        min_soc_percent:       parse_f64(KEY_MIN_SOC),
-        max_soc_percent:       parse_f64(KEY_MAX_SOC),
-        max_charge_power_w:    parse_i32(KEY_MAX_CHARGE_POWER),
-        max_discharge_power_w: parse_i32(KEY_MAX_DISCHARGE_POWER),
+        battery_soc:               f64_id(ID_BATTERY_SOC),
+        battery_state,
+        working_mode,
+        battery_power_w:           i32_id(ID_BATTERY_POWER),
+        dc_input_power1_w:         i32_id(ID_DC_INPUT1),
+        dc_input_power2_w:         i32_id(ID_DC_INPUT2),
+        total_dc_output_power_w:   i32_id(ID_TOTAL_DC_OUTPUT),
+        total_ac_output_power_w:   i32_id(ID_TOTAL_AC_OUTPUT),
+        total_ac_input_power_w:    i32_id(ID_TOTAL_AC_INPUT),
+        meter_power_w:             i32_id(ID_METER_POWER),
+        daily_production_kwh:      f64_id(ID_DAILY_PRODUCTION),
+        cumulative_production_kwh: f64_id(ID_CUMULATIVE_PRODUCTION) * 0.001, // raw ×0.001 = kWh
+        daily_charging_kwh:        f64_id(ID_DAILY_CHARGING),
+        daily_discharging_kwh:     f64_id(ID_DAILY_DISCHARGING),
+        total_charging_kwh:        f64_id(ID_TOTAL_CHARGING),
+        total_discharging_kwh:     f64_id(ID_TOTAL_DISCHARGING),
+        total_ac_input_energy_kwh: f64_id(ID_TOTAL_AC_INPUT_ENERGY),
     }
 }

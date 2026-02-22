@@ -56,7 +56,7 @@ async fn main() {
         match &p1 {
             Some(reading) => {
                 let r = &reading.raw;
-                log::info!(
+                log::debug!(
                     "[P1] tariff={} power={:+.0}W import={:.3}kWh export={:.3}kWh",
                     r.active_tariff,
                     r.active_power_w,
@@ -72,7 +72,7 @@ async fn main() {
             None => log::warn!("[P1] No reading this cycle - skipping optimiser."),
         }
 
-        log::info!(
+        log::debug!(
             "[Battery] SOC={:.1}% state={} mode={} power={:+}W meter={:+}W",
             battery.battery_soc,
             battery.battery_state,
@@ -93,6 +93,23 @@ async fn main() {
             battery.daily_charging_kwh,
             battery.daily_discharging_kwh,
         );
+
+        // Step 3b: reconciliation line — P1 vs Indevolt meter vs difference.
+        if let Some(ref reading) = p1 {
+            let p1_w      = reading.raw.active_power_w as i32;
+            let inv_w     = battery.meter_power_w;
+            let diff_w    = p1_w - inv_w;
+            log::info!(
+                "[EMS] P1={:+}W  Indevolt={:+}W  diff={:+}W | SOC={:.1}% {} {} bat={:+}W",
+                p1_w, inv_w, diff_w,
+                battery.battery_soc,
+                battery.battery_state,
+                battery.working_mode,
+                battery.battery_power_w,
+            );
+        } else {
+            log::warn!("[EMS] No P1 reading this cycle.");
+        }
 
         // Step 4: optimiser (placeholder - receives both readings together).
         // if let Some(p1_reading) = p1 {

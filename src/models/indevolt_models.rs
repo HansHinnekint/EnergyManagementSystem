@@ -1,26 +1,22 @@
-use serde::{Deserialize, Serialize};
-use reqwest::Error;
+use serde::Serialize;
 
 // --------------------------------------------------------------------------------------------------------------
-// Indevolt PowerFlex2000 local API models
+// Indevolt PowerFlex2000 local RPC API models
 //
-// The Indevolt exposes a key-value sensor API. Your n8n flow polls individual keys
-// via GET /device/sensor?key=<KEY>. Each response looks like:
-//   { "key": "BatterySOC", "value": "85.5", "unit": "%" }
+// Read:  GET  /rpc/Indevolt.GetData?config={"t":[id,...]}
+//        Response: flat JSON object {"<id>": <numeric_value>, ...}
 //
-// For control the API accepts:
-//   POST /device/control   body: { "key": "WorkingMode", "value": "ChargingFromGrid" }
-//
-// These models cover everything your BatteryData and BatteryConfig tables store
-// plus the control surface needed by the optimiser.
+// Write: POST /rpc/Indevolt.SetData
+//        Body: {"id": <numeric_id>, "value": <value>}
 // --------------------------------------------------------------------------------------------------------------
 
-/// Single sensor reading returned by GET /device/sensor?key=<KEY>
-#[derive(Deserialize, Debug, Clone)]
-pub struct SensorReading {
-    pub key:   String,
-    pub value: String,
-    pub unit:  Option<String>,
+/// Config parameter for GET /rpc/Indevolt.SetData?config=<json>
+/// Example: {"f":16,"t":47015,"v":[1,2000,100]}
+#[derive(Serialize, Debug)]
+pub struct SetDataConfig {
+    pub f: u32,       // Modbus function code (always 16)
+    pub t: u32,       // Register address
+    pub v: Vec<i64>,  // Values to write
 }
 
 // --------------------------------------------------------------------------------------------------------------
@@ -61,71 +57,43 @@ pub struct BatteryConfig {
 }
 
 // --------------------------------------------------------------------------------------------------------------
-// Working modes accepted by POST /device/control  key="WorkingMode"
+// Working modes for register 47005
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkingMode {
-    /// Default: use solar first, battery as buffer
+    /// Default: use solar first, battery as buffer (value = 1)
     SelfConsumedPrioritized,
-    /// Force charge from grid (arbitrage / negative pricing)
-    ChargingFromGrid,
-    /// Force discharge to loads / grid
-    DischargingToGrid,
-    /// Fully managed by the EMS; no automatic switching
-    Manual,
+    /// EMS takes direct real-time control via register 47015 (value = 4)
+    RealtimeControl,
+    /// Time-based charge/discharge schedule (value = 5)
+    Schedule,
 }
 
 impl WorkingMode {
-    /// Convert to the string value the Indevolt API expects.
-    pub fn as_api_str(&self) -> &'static str {
+    pub fn register_value(&self) -> i64 {
+        match self {
+            WorkingMode::SelfConsumedPrioritized => 1,
+            WorkingMode::RealtimeControl         => 4,
+            WorkingMode::Schedule                => 5,
+        }
+    }
+
+    pub fn from_register_value(v: i64) -> Option<Self> {
+        match v {
+            1 => Some(WorkingMode::SelfConsumedPrioritized),
+            4 => Some(WorkingMode::RealtimeControl),
+            5 => Some(WorkingMode::Schedule),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
         match self {
             WorkingMode::SelfConsumedPrioritized => "Self-consumed Prioritized",
-            WorkingMode::ChargingFromGrid        => "Charging From Grid",
-            WorkingMode::DischargingToGrid       => "Discharging To Grid",
-            WorkingMode::Manual                  => "Manual",
-        }
-    }
-
-    /// Parse from what the API returns (inverse of as_api_str).
-    pub fn from_api_str(s: &str) -> Option<Self> {
-        match s {
-            "Self-consumed Prioritized" => Some(WorkingMode::SelfConsumedPrioritized),
-            "Charging From Grid"        => Some(WorkingMode::ChargingFromGrid),
-            "Discharging To Grid"       => Some(WorkingMode::DischargingToGrid),
-            "Manual"                    => Some(WorkingMode::Manual),
-            _                           => None,
+            WorkingMode::RealtimeControl         => "Real-time Control",
+            WorkingMode::Schedule                => "Schedule",
         }
     }
 }
 
-// --------------------------------------------------------------------------------------------------------------
-// Control command sent to POST /device/control
 
-#[derive(Serialize, Debug)]
-pub struct ControlCommand {
-    pub key:   String,
-    pub value: String,
-}
-
-impl ControlCommand {
-    pub fn set_working_mode(mode: &WorkingMode) -> Self {
-        Self {
-            key:   "WorkingMode".to_string(),
-            value: mode.as_api_str().to_string(),
-        }
-    }
-
-    pub fn set_charge_power(watts: i32) -> Self {
-        Self {
-            key:   "MaxChargePower".to_string(),
-            value: watts.to_string(),
-        }
-    }
-
-    pub fn set_discharge_power(watts: i32) -> Self {
-        Self {
-            key:   "MaxDischargePower".to_string(),
-            value: watts.to_string(),
-        }
-    }
-}
